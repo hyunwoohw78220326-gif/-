@@ -4,25 +4,36 @@
 NEIS(나이스) 교육정보 개방 포털 오픈API를 이용해
 - 오늘/특정일 급식 메뉴 + 칼로리/영양정보
 - 이번 달 학사일정 (시험, 방학, 행사 등)
-을 한 화면에서 확인할 수 있는 학생용 대시보드.
+- 이번 주 시간표
+를 확인하고, 수행평가 마감일과 관련 자료를 직접 등록/관리할 수 있는 학생용 대시보드.
 
 실행:
     pip install -r requirements.txt
     streamlit run app.py
-
-배포:
-    Streamlit Community Cloud (share.streamlit.io) 에
-    이 폴더를 GitHub 저장소로 올린 뒤 그대로 연결하면 무료로 배포됩니다.
 """
 
 import calendar
-from datetime import date, timedelta
+import os
+import sqlite3
+import uuid
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import requests
 import streamlit as st
 
 NEIS_BASE = "https://open.neis.go.kr/hub"
+DB_PATH = os.path.join(os.path.dirname(__file__), "schoolog.db")
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+SCHOOL_LEVEL_TIMETABLE_API = {
+    "초등학교": "elsTimetable",
+    "중학교": "misTimetable",
+    "고등학교": "hisTimetable",
+}
+
+WEEKDAY_NAMES = ["월", "화", "수", "목", "금"]
 
 # ---------------------------------------------------------------------------
 # NEIS API 호출 함수들
@@ -36,16 +47,14 @@ def neis_request(endpoint: str, params: dict) -> list[dict]:
         res = requests.get(url, params=params, timeout=10)
         res.raise_for_status()
         data = res.json()
-    except Exception as e:  # 네트워크 오류, JSON 파싱 오류 등
+    except Exception as e:
         st.session_state["_last_error"] = str(e)
         return []
 
     if endpoint not in data:
-        # 인증키 오류/결과없음 등은 RESULT 코드로 내려옴
         return []
 
     body = data[endpoint]
-    # body[0] = head, body[1] = row 데이터
     if len(body) < 2 or "row" not in body[1]:
         return []
     return body[1]["row"]
@@ -53,7 +62,6 @@ def neis_request(endpoint: str, params: dict) -> list[dict]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_school(school_name: str, api_key: str) -> pd.DataFrame:
-    """학교명으로 학교 검색 -> 시도교육청코드/표준학교코드 확보"""
     params = {"Type": "json", "pSize": 30, "SCHUL_NM": school_name}
     if api_key:
         params["KEY"] = api_key
@@ -74,7 +82,6 @@ def search_school(school_name: str, api_key: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_meal(atpt_code: str, schul_code: str, ymd: str, api_key: str) -> list[dict]:
-    """특정 날짜(YYYYMMDD)의 급식 정보"""
     params = {
         "Type": "json",
         "pSize": 5,
@@ -89,7 +96,6 @@ def get_meal(atpt_code: str, schul_code: str, ymd: str, api_key: str) -> list[di
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_schedule(atpt_code: str, schul_code: str, ymd_from: str, ymd_to: str, api_key: str) -> list[dict]:
-    """기간(YYYYMMDD ~ YYYYMMDD) 학사일정"""
     params = {
         "Type": "json",
         "pSize": 100,
@@ -101,6 +107,147 @@ def get_schedule(atpt_code: str, schul_code: str, ymd_from: str, ymd_to: str, ap
     if api_key:
         params["KEY"] = api_key
     return neis_request("SchoolSchedule", params)
+
+
+def school_year_semester(d: date) -> tuple[int, int]:
+    """해당 날짜 기준 학년도(AY), 학기(SEM) 계산"""
+    if d.month >= 3:
+        return d.year, (1 if d.month <= 8 else 2)
+    return d.year - 1, 2
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_timetable_day(
+    level_api: str,
+    atpt_code: str,
+    schul_code: str,
+    grade: str,
+    class_nm: str,
+    ymd: str,
+    api_key: str,
+) -> list[dict]:
+    ay, sem = school_year_semester(datetime.strptime(ymd, "%Y%m%d").date())
+    params = {
+        "Type": "json",
+        "pSize": 20,
+        "ATPT_OFCDC_SC_CODE": atpt_code,
+        "SD_SCHUL_CODE": schul_code,
+        "AY": ay,
+        "SEM": sem,
+        "GRADE": grade,
+        "CLASS_NM": class_nm,
+        "ALL_TI_YMD": ymd,
+    }
+    if api_key:
+        params["KEY"] = api_key
+    return neis_request(level_api, params)
+
+
+def build_week_timetable(level_api, atpt_code, schul_code, grade, class_nm, monday: date, api_key) -> pd.DataFrame:
+    max_period = 9
+    grid = pd.DataFrame(
+        index=[f"{i}교시" for i in range(1, max_period + 1)],
+        columns=WEEKDAY_NAMES,
+    )
+    grid[:] = ""
+    for i, day_name in enumerate(WEEKDAY_NAMES):
+        d = monday + timedelta(days=i)
+        rows = get_timetable_day(level_api, atpt_code, schul_code, grade, class_nm, d.strftime("%Y%m%d"), api_key)
+        for r in rows:
+            perio = r.get("PERIO", "").strip()
+            subject = r.get("ITRT_CNTNT", "").strip()
+            if perio and f"{perio}교시" in grid.index:
+                grid.loc[f"{perio}교시", day_name] = subject
+    return grid
+
+
+# ---------------------------------------------------------------------------
+# 수행평가 저장소 (SQLite)
+# ---------------------------------------------------------------------------
+
+
+def db_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS assessments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            school_key TEXT,
+            subject TEXT,
+            title TEXT,
+            due_date TEXT,
+            memo TEXT,
+            created_at TEXT
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS assessment_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            assessment_id INTEGER,
+            filename TEXT,
+            stored_path TEXT
+        )"""
+    )
+    return conn
+
+
+def add_assessment(school_key, subject, title, due_date_str, memo, uploaded_files):
+    conn = db_conn()
+    cur = conn.execute(
+        "INSERT INTO assessments (school_key, subject, title, due_date, memo, created_at) VALUES (?,?,?,?,?,?)",
+        (school_key, subject, title, due_date_str, memo, datetime.now().isoformat()),
+    )
+    assessment_id = cur.lastrowid
+    for f in uploaded_files or []:
+        ext = os.path.splitext(f.name)[1]
+        stored_name = f"{uuid.uuid4().hex}{ext}"
+        stored_path = os.path.join(UPLOAD_DIR, stored_name)
+        with open(stored_path, "wb") as out:
+            out.write(f.getbuffer())
+        conn.execute(
+            "INSERT INTO assessment_files (assessment_id, filename, stored_path) VALUES (?,?,?)",
+            (assessment_id, f.name, stored_path),
+        )
+    conn.commit()
+    conn.close()
+
+
+def list_assessments(school_key):
+    conn = db_conn()
+    rows = conn.execute(
+        "SELECT id, subject, title, due_date, memo FROM assessments WHERE school_key=? ORDER BY due_date ASC",
+        (school_key,),
+    ).fetchall()
+    result = []
+    for r in rows:
+        files = conn.execute(
+            "SELECT filename, stored_path FROM assessment_files WHERE assessment_id=?", (r[0],)
+        ).fetchall()
+        result.append(
+            {
+                "id": r[0],
+                "subject": r[1],
+                "title": r[2],
+                "due_date": r[3],
+                "memo": r[4],
+                "files": [{"filename": f[0], "path": f[1]} for f in files],
+            }
+        )
+    conn.close()
+    return result
+
+
+def delete_assessment(assessment_id):
+    conn = db_conn()
+    files = conn.execute(
+        "SELECT stored_path FROM assessment_files WHERE assessment_id=?", (assessment_id,)
+    ).fetchall()
+    for (path,) in files:
+        if os.path.exists(path):
+            os.remove(path)
+    conn.execute("DELETE FROM assessment_files WHERE assessment_id=?", (assessment_id,))
+    conn.execute("DELETE FROM assessments WHERE id=?", (assessment_id,))
+    conn.commit()
+    conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -119,13 +266,18 @@ st.markdown(
                  border-radius:999px; padding:2px 10px; margin:2px; font-size:0.85rem;}
     .event-row {padding:0.5rem 0.8rem; border-left:4px solid #f97316;
                 background:#fafafa; border-radius:6px; margin-bottom:6px;}
+    .task-card {border-radius:12px; padding:1rem 1.2rem; margin-bottom:0.8rem; border:1px solid #e5e7eb;}
+    .task-urgent {background:#fef2f2; border-color:#fecaca;}
+    .task-soon {background:#fffbeb; border-color:#fde68a;}
+    .task-normal {background:#f0fdf4; border-color:#bbf7d0;}
+    .task-done {background:#f3f4f6; border-color:#e5e7eb; color:#9ca3af;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 st.title("🏫 스쿨로그 School-Log")
-st.caption("급식 · 영양정보 · 학사일정을 한 곳에서. 여러 곳을 찾아볼 필요 없이 오늘의 학교 정보를 확인하세요.")
+st.caption("급식 · 영양정보 · 학사일정 · 시간표 · 수행평가를 한 곳에서.")
 
 with st.sidebar:
     st.header("⚙️ 설정")
@@ -159,14 +311,25 @@ with st.sidebar:
     st.success(f"선택된 학교: {selected.SCHUL_NM}")
     st.caption(selected.get("ORG_RDNMA", ""))
 
+    st.subheader("우리 반 정보")
+    my_grade = st.text_input("학년", value=st.session_state.get("my_grade", "1"))
+    my_class = st.text_input("반", value=st.session_state.get("my_class", "1"))
+    st.session_state["my_grade"] = my_grade
+    st.session_state["my_class"] = my_class
+
 atpt_code = selected["ATPT_OFCDC_SC_CODE"]
 schul_code = selected["SD_SCHUL_CODE"]
+school_kind = selected.get("SCHUL_KND_SC_NM", "중학교")
+school_key = f"{atpt_code}_{schul_code}"
+level_api = SCHOOL_LEVEL_TIMETABLE_API.get(school_kind, "misTimetable")
 
-tab_meal, tab_calendar = st.tabs(["🍱 오늘의 급식", "📅 학사일정 · 행사"])
+tab_meal, tab_timetable, tab_calendar, tab_tasks = st.tabs(
+    ["🍱 오늘의 급식", "🕒 시간표", "📅 학사일정 · 행사", "📝 수행평가 관리"]
+)
 
 # --- 급식 탭 -----------------------------------------------------------
 with tab_meal:
-    picked_date = st.date_input("날짜 선택", value=date.today())
+    picked_date = st.date_input("날짜 선택", value=date.today(), key="meal_date")
     ymd = picked_date.strftime("%Y%m%d")
 
     meals = get_meal(atpt_code, schul_code, ymd, api_key)
@@ -176,8 +339,6 @@ with tab_meal:
     else:
         for m in meals:
             menu_items = [x.strip() for x in m.get("DDISH_NM", "").split("<br/>") if x.strip()]
-            # 알레르기 표시 번호 제거 (예: '김치찌개 5.6.9.' -> '김치찌개')
-            menu_items_clean = [item.split(" (")[0] for item in menu_items]
 
             st.markdown(f"#### {m.get('MMEAL_SC_NM', '급식')} · {m.get('MLSV_YMD', ymd)}")
             st.markdown('<div class="meal-card">', unsafe_allow_html=True)
@@ -194,11 +355,27 @@ with tab_meal:
                     pills = "".join(f'<span class="nutri-pill">{n}</span>' for n in nutri_items)
                     st.markdown(pills, unsafe_allow_html=True)
 
+# --- 시간표 탭 ----------------------------------------------------------
+with tab_timetable:
+    today = date.today()
+    this_monday = today - timedelta(days=today.weekday())
+    week_start = st.date_input("이번 주 월요일", value=this_monday, key="week_start")
+    week_start = week_start - timedelta(days=week_start.weekday())  # 안전하게 월요일로 보정
+
+    with st.spinner("시간표를 불러오는 중이에요..."):
+        grid = build_week_timetable(level_api, atpt_code, schul_code, my_grade, my_class, week_start, api_key)
+
+    if grid.replace("", pd.NA).dropna(how="all").empty:
+        st.info("해당 주의 시간표 정보가 없어요. 학년/반 정보를 다시 확인해 주세요.")
+    else:
+        st.dataframe(grid, use_container_width=True, height=380)
+    st.caption(f"{week_start.strftime('%Y-%m-%d')} (월) ~ {(week_start + timedelta(days=4)).strftime('%Y-%m-%d')} (금) 기준")
+
 # --- 학사일정 탭 --------------------------------------------------------
 with tab_calendar:
     today = date.today()
-    year = st.selectbox("연도", list(range(today.year - 1, today.year + 2)), index=1)
-    month = st.selectbox("월", list(range(1, 13)), index=today.month - 1)
+    year = st.selectbox("연도", list(range(today.year - 1, today.year + 2)), index=1, key="cal_year")
+    month = st.selectbox("월", list(range(1, 13)), index=today.month - 1, key="cal_month")
 
     first_day = date(year, month, 1)
     last_day = date(year, month, calendar.monthrange(year, month)[1])
@@ -225,6 +402,72 @@ with tab_calendar:
                 f'<span style="color:#9ca3af;">({note})</span></div>',
                 unsafe_allow_html=True,
             )
+
+# --- 수행평가 관리 탭 ----------------------------------------------------
+with tab_tasks:
+    st.subheader("➕ 새 수행평가 등록")
+    with st.form("new_assessment", clear_on_submit=True):
+        c1, c2, c3 = st.columns([1, 2, 1])
+        subject = c1.text_input("과목")
+        title = c2.text_input("평가명 / 과제명")
+        due = c3.date_input("마감일", value=date.today())
+        memo = st.text_area("메모 (제출 방법, 준비물, 채점 기준 등)")
+        files = st.file_uploader("관련 자료 첨부 (여러 개 선택 가능)", accept_multiple_files=True)
+        submitted = st.form_submit_button("등록하기", use_container_width=True)
+        if submitted:
+            if not subject or not title:
+                st.warning("과목과 평가명은 꼭 입력해 주세요.")
+            else:
+                add_assessment(school_key, subject, title, due.strftime("%Y-%m-%d"), memo, files)
+                st.success("등록되었습니다!")
+                st.rerun()
+
+    st.subheader("📋 등록된 수행평가")
+    items = list_assessments(school_key)
+
+    if not items:
+        st.info("아직 등록된 수행평가가 없어요.")
+    else:
+        today = date.today()
+        for item in items:
+            due_date = datetime.strptime(item["due_date"], "%Y-%m-%d").date()
+            d_day = (due_date - today).days
+
+            if d_day < 0:
+                css_class, badge = "task-done", "마감됨"
+            elif d_day == 0:
+                css_class, badge = "task-urgent", "D-DAY"
+            elif d_day <= 3:
+                css_class, badge = "task-urgent", f"D-{d_day}"
+            elif d_day <= 7:
+                css_class, badge = "task-soon", f"D-{d_day}"
+            else:
+                css_class, badge = "task-normal", f"D-{d_day}"
+
+            st.markdown(f'<div class="task-card {css_class}">', unsafe_allow_html=True)
+            col_a, col_b, col_c = st.columns([5, 1, 1])
+            with col_a:
+                st.markdown(f"**[{item['subject']}] {item['title']}**")
+                st.caption(f"마감일: {item['due_date']}")
+                if item["memo"]:
+                    st.write(item["memo"])
+            with col_b:
+                st.markdown(f"### {badge}")
+            with col_c:
+                if st.button("삭제", key=f"del_{item['id']}"):
+                    delete_assessment(item["id"])
+                    st.rerun()
+
+            for f in item["files"]:
+                if os.path.exists(f["path"]):
+                    with open(f["path"], "rb") as fp:
+                        st.download_button(
+                            f"📎 {f['filename']}",
+                            data=fp.read(),
+                            file_name=f["filename"],
+                            key=f"dl_{item['id']}_{f['filename']}",
+                        )
+            st.markdown("</div>", unsafe_allow_html=True)
 
 st.divider()
 st.caption("데이터 출처: 교육부·한국교육학술정보원 나이스 교육정보 개방 포털 (open.neis.go.kr)")
